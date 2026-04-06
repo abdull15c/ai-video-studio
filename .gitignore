@@ -1,0 +1,12 @@
+venv/
+storage/
+__pycache__/
+*.pyc
+.env
+google_key.json
+token.json
+token.pickle
+*.mp4
+*.mp3
+*.jpg
+*.sqlite

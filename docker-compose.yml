@@ -1,0 +1,15 @@
+# Дашборд: http://localhost:8000
+# Хранилище и .env монтируются с хоста.
+
+services:
+  dashboard:
+    build: .
+    command: uvicorn dashboard.api:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./storage:/app/storage
+      - ./.env:/app/.env:ro
+    working_dir: /app
+    environment:
+      - WHISPER_CACHE_DIR=/app/storage/whisper_cache

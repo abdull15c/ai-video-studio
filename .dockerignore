@@ -1,0 +1,15 @@
+.git
+.gitignore
+__pycache__
+*.py[cod]
+.pytest_cache
+.venv
+venv
+.env
+*.sqlite
+storage/logs
+storage/projects
+storage/browser_profiles
+agent-transcripts
+.cursor
+*.md
