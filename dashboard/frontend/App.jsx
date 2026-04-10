@@ -109,6 +109,7 @@ function App() {
   const [newTopic, setNewTopic] = useState("");
   const [queueDraft, setQueueDraft] = useState("");
   const [newFormat, setNewFormat] = useState("short");
+  const [newPreset, setNewPreset] = useState("1 hour");
   const [newVoice, setNewVoice] = useState("");
   const [dragFrom, setDragFrom] = useState(null);
 
@@ -203,6 +204,25 @@ function App() {
     }
   };
 
+  const uploadAvatar = async (projectId, file) => {
+    if (!file) return;
+    const formData = new FormData();
+    formData.append("file", file);
+    try {
+      const r = await fetch(`/api/projects/${projectId}/avatar`, {
+        method: "POST",
+        body: formData,
+      });
+      if (!r.ok) throw new Error(await r.text());
+      alert("Аватар успешно загружен!");
+      // Обновляем детали проекта
+      const dr = await fetch(`/api/projects/${projectId}`).then((r) => r.json());
+      setDetail(dr);
+    } catch (e) {
+      alert("Ошибка при загрузке аватара: " + e.message);
+    }
+  };
+
   const submitNew = async (e) => {
     e.preventDefault();
     if (!newTopic.trim()) return;
@@ -214,6 +234,7 @@ function App() {
           topic: newTopic.trim(),
           format: newFormat,
           voice: newVoice || null,
+          preset: newFormat === "long" ? newPreset : "default",
         }),
       });
       if (!r.ok) throw new Error(await r.text());
@@ -387,31 +408,91 @@ function App() {
                               Скачать превью
                             </a>
                           )}
-                          <span style={{ color: "#9aa0a6", fontSize: 13 }}>
+                          <span style={{ color: "#9aa0a6", fontSize: 13, alignSelf: "center" }}>
                             Размер: {formatBytes(detail.final_video_size_bytes)} · Длительность: {formatDur(detail.final_video_duration_sec)}
                             {detail.llm_usage_estimated_usd != null && detail.llm_usage_estimated_usd > 0 && (
                               <> · LLM ~${Number(detail.llm_usage_estimated_usd).toFixed(4)}</>
                             )}
                           </span>
                         </div>
-                        <div style={{ fontWeight: 600, marginBottom: 8 }}>Главы и сцены</div>
-                        <div style={{ maxHeight: 220, overflow: "auto", fontSize: 13, marginBottom: 16 }}>
+
+                        {/* Блок управления аватаром (Talking Head) */}
+                        <div style={{ background: "#1a1d26", padding: 12, borderRadius: 8, marginBottom: 16, border: "1px solid #2a2f3d" }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                            <div>
+                              <strong style={{ display: "block", marginBottom: 4 }}>Аватар (Talking Head)</strong>
+                              <span style={{ fontSize: 12, color: "#9aa0a6" }}>
+                                {detail.avatar_type === "none" || !detail.avatar_type 
+                                  ? "Не установлен" 
+                                  : `Установлен (${detail.avatar_type.toUpperCase()}) - будет добавлен при монтаже`}
+                              </span>
+                            </div>
+                            <div style={{ display: "flex", gap: 8 }}>
+                              <label style={{ ...btnSm, cursor: "pointer", background: "#4caf50" }}>
+                                Загрузить PNG / MP4
+                                <input 
+                                  type="file" 
+                                  accept=".png,.jpg,.jpeg,.mp4" 
+                                  style={{ display: "none" }}
+                                  onChange={(e) => uploadAvatar(detail.id, e.target.files[0])}
+                                />
+                              </label>
+                            </div>
+                          </div>
+                          <div style={{ fontSize: 11, color: "#78909c", marginTop: 6 }}>
+                            * PNG для статичного (дышащего) аватара. MP4 для анимированного (моргание). Аватар должен иметь прозрачный фон или хромакей. 
+                            Загружайте аватар до начала этапа монтажа!
+                          </div>
+                        </div>
+
+                        <div style={{ fontWeight: 600, marginBottom: 12, marginTop: 12 }}>Предпросмотр: Раскадровка (Storyboard)</div>
+                        <div style={{ 
+                          maxHeight: 400, 
+                          overflowY: "auto", 
+                          fontSize: 13, 
+                          marginBottom: 16,
+                          display: "flex",
+                          flexDirection: "column",
+                          gap: "12px"
+                        }}>
                           {detail.chapters?.map((ch) => (
-                            <div key={ch.id} style={{ marginBottom: 8 }}>
-                              <strong>
-                                {ch.number}. {ch.title}
+                            <div key={ch.id} style={{ background: "#222632", borderRadius: 8, padding: 12, border: "1px solid #2a2f3d" }}>
+                              <strong style={{ display: "block", marginBottom: 12, fontSize: 14, color: "#fff" }}>
+                                Глава {ch.number}. {ch.title}
                               </strong>
-                              <ul style={{ margin: "4px 0 0 16px", color: "#9aa0a6" }}>
+                              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 12 }}>
                                 {ch.scenes?.map((s) => (
-                                  <li key={s.id}>
-                                    Сцена {s.number}: {(s.narration || "").slice(0, 80)}
-                                    {(s.narration || "").length > 80 ? "…" : ""}
-                                  </li>
+                                  <div key={s.id} style={{ 
+                                    background: "#13151c", 
+                                    borderRadius: 6, 
+                                    padding: 10,
+                                    borderLeft: "3px solid #3949ab"
+                                  }}>
+                                    <div style={{ fontWeight: 600, marginBottom: 6, color: "#82b1ff" }}>Сцена {s.number}</div>
+                                    
+                                    <div style={{ marginBottom: 8 }}>
+                                      <span style={{ color: "#9aa0a6", fontSize: 11, textTransform: "uppercase" }}>Текст диктора:</span>
+                                      <div style={{ fontStyle: "italic", marginTop: 2, lineHeight: 1.4 }}>"{s.narration}"</div>
+                                    </div>
+                                    
+                                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, fontSize: 11 }}>
+                                      {s.camera && <span style={{ background: "#333", padding: "2px 6px", borderRadius: 4 }}>🎥 {s.camera}</span>}
+                                      {s.mood && <span style={{ background: "#333", padding: "2px 6px", borderRadius: 4 }}>🎭 {s.mood}</span>}
+                                      {s.duration_sec && <span style={{ background: "#333", padding: "2px 6px", borderRadius: 4 }}>⏱ ~{s.duration_sec}s</span>}
+                                    </div>
+                                    
+                                    {s.image_prompt && (
+                                      <div style={{ marginTop: 8, fontSize: 11, color: "#b0bec5", background: "#0a0c10", padding: "4px 8px", borderRadius: 4 }}>
+                                        <strong>Визуал:</strong> {s.image_prompt}
+                                      </div>
+                                    )}
+                                  </div>
                                 ))}
-                              </ul>
+                              </div>
                             </div>
                           ))}
                         </div>
+
                         <div style={{ fontWeight: 600, marginBottom: 8 }}>Лог (pipeline)</div>
                         <pre
                           style={{
@@ -465,6 +546,17 @@ function App() {
               <option value="main">main</option>
               <option value="long">long</option>
             </select>
+            
+            {newFormat === "long" && (
+              <>
+                <label style={lbl}>Длительность (Long)</label>
+                <select value={newPreset} onChange={(e) => setNewPreset(e.target.value)} style={{ ...inp, width: "100%" }}>
+                  <option value="1 hour">До 1 часа</option>
+                  <option value="2 hours">До 2 часов</option>
+                </select>
+              </>
+            )}
+
             <label style={lbl}>Голос (опционально)</label>
             <select value={newVoice} onChange={(e) => setNewVoice(e.target.value)} style={{ ...inp, width: "100%" }}>
               <option value="">— LLM / по умолчанию —</option>

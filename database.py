@@ -82,6 +82,73 @@ def init_db():
         cursor.execute("ALTER TABLE projects ADD COLUMN image_engine TEXT")
     except sqlite3.OperationalError:
         pass
+    try:
+        cursor.execute("ALTER TABLE projects ADD COLUMN avatar_type TEXT DEFAULT 'none'")
+    except sqlite3.OperationalError:
+        pass
+
+    # New fields for projects
+    for col, def_val in [
+        ("style_preset", "TEXT"),
+        ("subtitle_style", "TEXT"),
+        ("voice_profile", "TEXT"),
+        ("quality_mode", "TEXT"),
+        ("manual_review_required", "BOOLEAN DEFAULT 0"),
+        ("keep_intermediates", "BOOLEAN DEFAULT 0"),
+        ("final_quality_score", "REAL"),
+        ("quality_report_json", "TEXT"),
+        ("review_notes", "TEXT"),
+        ("audio_mastering_preset", "TEXT")
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE projects ADD COLUMN {col} {def_val}")
+        except sqlite3.OperationalError:
+            pass
+
+    # New fields for scenes
+    for col, def_val in [
+        ("scene_goal", "TEXT"),
+        ("visual_role", "TEXT"),
+        ("shot_type", "TEXT"),
+        ("motion_type", "TEXT"),
+        ("transition_in", "TEXT"),
+        ("transition_out", "TEXT"),
+        ("intensity", "TEXT"),
+        ("continuity_anchor", "TEXT"),
+        ("visual_score", "REAL"),
+        ("audio_score", "REAL"),
+        ("subtitle_score", "REAL"),
+        ("scene_status", "TEXT DEFAULT 'pending'"),
+        ("manual_override_json", "TEXT"),
+        ("scene_role", "TEXT"),
+        ("energy_curve", "TEXT"),
+        ("edit_density", "TEXT"),
+        ("semantic_match_score", "REAL"),
+        ("motion_score", "REAL"),
+        ("technical_score", "REAL"),
+        ("continuity_score", "REAL"),
+        ("review_reason", "TEXT")
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE scenes ADD COLUMN {col} {def_val}")
+        except sqlite3.OperationalError:
+            pass
+            
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS project_quality_reports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER,
+        overall_score REAL,
+        weak_scene_count INTEGER,
+        avg_visual_score REAL,
+        avg_audio_score REAL,
+        avg_subtitle_score REAL,
+        warnings_json TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(project_id) REFERENCES projects(id)
+    );
+    """)
+    
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS tts_usage_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,6 +162,19 @@ def init_db():
         estimated_cost_usd REAL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(project_id) REFERENCES projects(id)
+    );
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS scene_generation_attempts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scene_id INTEGER,
+        attempt_no INTEGER,
+        query_json TEXT,
+        selected_asset_path TEXT,
+        visual_score REAL,
+        failure_reason TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(scene_id) REFERENCES scenes(id)
     );
     """)
     cursor.execute("""
@@ -254,6 +334,29 @@ def update_project_tts_voice(project_id, voice_id):
     return v
 
 
+def log_scene_generation_attempt(
+    scene_id: int,
+    query_json: str,
+    selected_asset_path: str,
+    visual_score: float = None,
+    failure_reason: str = None
+):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COALESCE(MAX(attempt_no), 0) + 1 FROM scene_generation_attempts WHERE scene_id = ?", (scene_id,))
+    attempt_no = cursor.fetchone()[0]
+    
+    cursor.execute(
+        """
+        INSERT INTO scene_generation_attempts (
+            scene_id, attempt_no, query_json, selected_asset_path, visual_score, failure_reason
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (scene_id, attempt_no, query_json, selected_asset_path, visual_score, failure_reason)
+    )
+    conn.commit()
+    conn.close()
+
 def log_tts_usage(
     project_id,
     scene_id,
@@ -365,6 +468,16 @@ def mark_project_processing(project_id):
     conn.commit()
     conn.close()
 
+def mark_project_paused_for_review(project_id, message: str):
+    msg = (message or "")[:4000]
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE projects SET status = 'paused_for_review', error_message = ? WHERE id = ?",
+        (msg, project_id),
+    )
+    conn.commit()
+    conn.close()
 
 def mark_project_failed(project_id, message: str):
     msg = (message or "")[:4000]
@@ -378,13 +491,13 @@ def mark_project_failed(project_id, message: str):
     conn.close()
 
 
-def insert_dashboard_project(title, format_type, tts_voice=None):
+def insert_dashboard_project(title, format_type, tts_voice=None, preset="default"):
     """Новая строка проекта для дашборда (без дедупликации по названию)."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO projects (title, format, preset, status, tts_voice) VALUES (?, ?, 'default', 'pending', ?)",
-        (title, format_type, tts_voice),
+        "INSERT INTO projects (title, format, preset, status, tts_voice) VALUES (?, ?, ?, 'pending', ?)",
+        (title, format_type, preset, tts_voice),
     )
     project_id = cursor.lastrowid
     conn.commit()
@@ -396,7 +509,9 @@ def get_project_row(project_id):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        """SELECT id, title, status, format, preset, tts_voice, created_at, error_message
+        """SELECT id, title, status, format, preset, tts_voice, created_at, error_message, avatar_type,
+                  style_preset, subtitle_style, voice_profile, quality_mode, manual_review_required,
+                  keep_intermediates, final_quality_score, quality_report_json, review_notes, audio_mastering_preset
            FROM projects WHERE id = ?""",
         (project_id,),
     )
@@ -413,7 +528,26 @@ def get_project_row(project_id):
         "tts_voice": row[5],
         "created_at": row[6],
         "error_message": row[7],
+        "avatar_type": row[8] if len(row) > 8 else "none",
+        "style_preset": row[9] if len(row) > 9 else "default",
+        "subtitle_style": row[10] if len(row) > 10 else "default",
+        "voice_profile": row[11] if len(row) > 11 else "default",
+        "quality_mode": row[12] if len(row) > 12 else "standard",
+        "manual_review_required": bool(row[13]) if len(row) > 13 else False,
+        "keep_intermediates": bool(row[14]) if len(row) > 14 else False,
+        "final_quality_score": row[15] if len(row) > 15 else None,
+        "quality_report_json": row[16] if len(row) > 16 else None,
+        "review_notes": row[17] if len(row) > 17 else None,
+        "audio_mastering_preset": row[18] if len(row) > 18 else None,
     }
+
+
+def update_project_avatar(project_id, avatar_type):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE projects SET avatar_type = ? WHERE id = ?", (avatar_type, project_id))
+    conn.commit()
+    conn.close()
 
 
 def get_checkpoint_steps(project_id):
@@ -429,13 +563,15 @@ def get_checkpoint_steps(project_id):
 
 
 def derive_project_ui_status(row, checkpoint_steps):
-    """Унифицированный статус для UI: completed | failed | processing | pending | queued."""
+    """Унифицированный статус для UI: completed | failed | processing | pending | queued | paused_for_review."""
     st = row["status"] or "created"
     cps = set(checkpoint_steps)
     if st == "completed":
         return "completed"
     if st == "failed":
         return "failed"
+    if st == "paused_for_review":
+        return "paused_for_review"
     if st == "processing":
         return "processing"
     if st == "pending":
@@ -465,7 +601,7 @@ def list_projects_paginated(
     sort_desc=True,
 ):
     """
-    status_filter: all | completed | failed | processing | queued | pending
+    status_filter: all | completed | failed | processing | queued | pending | paused_for_review
     queued = только status pending (дашборд, ещё не стартовал)
     pending = created без чекпоинтов (старый CLI)
     processing = processing или created с чекпоинтами
@@ -493,6 +629,8 @@ def list_projects_paginated(
             where.append("p.status = 'completed'")
         elif status_filter == "failed":
             where.append("p.status = 'failed'")
+        elif status_filter == "paused_for_review":
+            where.append("p.status = 'paused_for_review'")
         elif status_filter == "queued":
             where.append("p.status = 'pending'")
         elif status_filter == "pending":
@@ -516,7 +654,9 @@ def list_projects_paginated(
 
     cursor.execute(
         f"""
-        SELECT p.id, p.title, p.status, p.format, p.tts_voice, p.created_at, p.error_message
+        SELECT p.id, p.title, p.status, p.format, p.tts_voice, p.created_at, p.error_message, p.avatar_type,
+               p.style_preset, p.subtitle_style, p.voice_profile, p.quality_mode, p.manual_review_required,
+               p.keep_intermediates, p.final_quality_score, p.quality_report_json, p.review_notes, p.audio_mastering_preset
         FROM projects p
         WHERE {where_sql}
         ORDER BY p.created_at {order}
@@ -538,6 +678,17 @@ def list_projects_paginated(
             "tts_voice": r[4],
             "created_at": r[5],
             "error_message": r[6],
+            "avatar_type": r[7] if len(r) > 7 else "none",
+            "style_preset": r[8] if len(r) > 8 else "default",
+            "subtitle_style": r[9] if len(r) > 9 else "default",
+            "voice_profile": r[10] if len(r) > 10 else "default",
+            "quality_mode": r[11] if len(r) > 11 else "standard",
+            "manual_review_required": bool(r[12]) if len(r) > 12 else False,
+            "keep_intermediates": bool(r[13]) if len(r) > 13 else False,
+            "final_quality_score": r[14] if len(r) > 14 else None,
+            "quality_report_json": r[15] if len(r) > 15 else None,
+            "review_notes": r[16] if len(r) > 16 else None,
+            "audio_mastering_preset": r[17] if len(r) > 17 else None,
         }
         cps = get_checkpoint_steps(pid)
         items.append(
@@ -569,6 +720,7 @@ def count_projects_stats():
         WHERE p.status NOT IN ('completed', 'failed')
         AND (
             p.status = 'processing'
+            OR p.status = 'paused_for_review'
             OR p.status = 'pending'
             OR (p.status = 'created' AND EXISTS (SELECT 1 FROM checkpoints c WHERE c.project_id = p.id))
         )
@@ -592,10 +744,31 @@ def save_script_to_db(project_id, script_data):
                        (project_id, chapter['chapter_number'], chapter['chapter_title']))
         chapter_id = cursor.lastrowid
         for scene in chapter.get('scenes', []):
-            cursor.execute('''INSERT INTO scenes (chapter_id, number, narration, image_prompt, mood, camera, duration_sec)
-                              VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                           (chapter_id, scene['scene_number'], scene['narration'], scene['image_prompt'], 
-                            scene['mood'], scene['camera'], scene['duration_sec']))
+            cursor.execute('''INSERT INTO scenes (
+                                  chapter_id, number, narration, image_prompt, mood, camera, duration_sec,
+                                  scene_goal, visual_role, shot_type, motion_type, transition_in, transition_out, intensity, continuity_anchor,
+                                  scene_role, energy_curve, edit_density
+                              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                           (
+                               chapter_id, 
+                               scene.get('scene_number'), 
+                               scene.get('narration'), 
+                               scene.get('image_prompt'), 
+                               scene.get('mood'), 
+                               scene.get('camera'), 
+                               scene.get('duration_sec'),
+                               scene.get('scene_goal'),
+                               scene.get('visual_role'),
+                               scene.get('shot_type'),
+                               scene.get('motion_type'),
+                               scene.get('transition_in'),
+                               scene.get('transition_out'),
+                               str(scene.get('intensity', '')),
+                               scene.get('continuity_anchor'),
+                               scene.get('scene_role'),
+                               scene.get('energy_curve'),
+                               scene.get('edit_density')
+                           ))
     conn.commit()
     conn.close()
 
@@ -610,6 +783,14 @@ def validate_script_data(script_data):
     return True, ""
 
 
+def get_project_preset(project_id):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT preset FROM projects WHERE id = ?", (project_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else "default"
+
 def get_project_script(project_id, require_scenes=True):
     conn = get_connection()
     cursor = conn.cursor()
@@ -618,7 +799,9 @@ def get_project_script(project_id, require_scenes=True):
     result = []
     for ch_id, ch_num, ch_title in chapters:
         cursor.execute(
-            """SELECT id, number, narration, image_prompt, mood, camera, duration_sec
+            """SELECT id, number, narration, image_prompt, mood, camera, duration_sec,
+                      scene_goal, visual_role, shot_type, motion_type, transition_in, transition_out, intensity, continuity_anchor,
+                      scene_role, energy_curve, edit_density, scene_status, review_reason
                FROM scenes WHERE chapter_id = ? ORDER BY number""",
             (ch_id,),
         )
@@ -632,6 +815,19 @@ def get_project_script(project_id, require_scenes=True):
                 "mood": r[4],
                 "camera": r[5],
                 "duration_sec": r[6],
+                "scene_goal": r[7],
+                "visual_role": r[8],
+                "shot_type": r[9],
+                "motion_type": r[10],
+                "transition_in": r[11],
+                "transition_out": r[12],
+                "intensity": r[13],
+                "continuity_anchor": r[14],
+                "scene_role": r[15],
+                "energy_curve": r[16],
+                "edit_density": r[17],
+                "scene_status": r[18],
+                "review_reason": r[19],
             }
             for r in scenes_raw
         ]
@@ -650,3 +846,80 @@ def update_scene_audio(scene_id, path):
     cursor.execute("UPDATE scenes SET audio_path = ? WHERE id = ?", (path, scene_id))
     conn.commit()
     conn.close()
+
+def update_scene_fields(scene_id: int, fields: dict):
+    if not fields:
+        return
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    set_clauses = []
+    params = []
+    
+    allowed_fields = {
+        "narration", "image_prompt", "mood", "camera", "duration_sec",
+        "scene_goal", "visual_role", "shot_type", "motion_type",
+        "transition_in", "transition_out", "intensity", "continuity_anchor",
+        "scene_status", "manual_override_json", "scene_role", "energy_curve", 
+        "edit_density", "semantic_match_score", "motion_score", "technical_score",
+        "continuity_score", "review_reason", "visual_score", "audio_score", "subtitle_score"
+    }
+    
+    for k, v in fields.items():
+        if k in allowed_fields:
+            set_clauses.append(f"{k} = ?")
+            params.append(v)
+            
+    if set_clauses:
+        params.append(scene_id)
+        sql = f"UPDATE scenes SET {', '.join(set_clauses)} WHERE id = ?"
+        cursor.execute(sql, params)
+        conn.commit()
+    conn.close()
+
+def get_scene_by_id(scene_id: int):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """SELECT id, chapter_id, number, narration, image_prompt, mood, camera, duration_sec,
+                  scene_goal, visual_role, shot_type, motion_type, transition_in, transition_out, intensity, continuity_anchor,
+                  visual_score, audio_score, subtitle_score, scene_status, manual_override_json
+           FROM scenes WHERE id = ?""",
+        (scene_id,)
+    )
+    r = cursor.fetchone()
+    conn.close()
+    if not r:
+        return None
+    return {
+        "id": r[0],
+        "chapter_id": r[1],
+        "number": r[2],
+        "narration": r[3],
+        "image_prompt": r[4],
+        "mood": r[5],
+        "camera": r[6],
+        "duration_sec": r[7],
+        "scene_goal": r[8],
+        "visual_role": r[9],
+        "shot_type": r[10],
+        "motion_type": r[11],
+        "transition_in": r[12],
+        "transition_out": r[13],
+        "intensity": r[14],
+        "continuity_anchor": r[15],
+        "visual_score": r[16],
+        "audio_score": r[17],
+        "subtitle_score": r[18],
+        "scene_status": r[19],
+        "manual_override_json": r[20],
+    }
+
+def get_project_id_by_scene(scene_id: int):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT c.project_id FROM chapters c JOIN scenes s ON s.chapter_id = c.id WHERE s.id = ?", (scene_id,))
+    r = cursor.fetchone()
+    conn.close()
+    return r[0] if r else None
+

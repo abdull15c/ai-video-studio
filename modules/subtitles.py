@@ -50,19 +50,61 @@ def _format_ass_time(seconds):
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
-def _build_ass_header(font_name: str, font_size: int, margin_v: int) -> str:
-    return f"""[Script Info]
+def _build_ass_header(style_preset: str, default_font_name: str, font_size: int, margin_v: int, is_vertical: bool) -> tuple[str, str]:
+    """Возвращает (ass_header, style_type)"""
+    font = default_font_name
+    outline = 4
+    shadow = 4
+    bold = 1
+    case_style = "default" # "upper", "lower", "default"
+    
+    if style_preset == "viral_big_caps":
+        font = "Bebas Neue" if default_font_name != "Impact" else "Impact"
+        font_size = int(font_size * 1.3) # Bigger
+        outline = 5
+        shadow = 0
+        case_style = "upper"
+    elif style_preset == "documentary_clean_lower":
+        font = "Montserrat"
+        outline = 2
+        shadow = 2
+        bold = 0
+        case_style = "lower"
+    elif style_preset == "premium_minimal":
+        font = "Montserrat"
+        font_size = int(font_size * 0.8)
+        outline = 1
+        shadow = 1
+        bold = 0
+        case_style = "default"
+    elif style_preset == "education_readable":
+        font = "Arial"
+        outline = 3
+        shadow = 3
+        case_style = "default"
+    elif style_preset == "dramatic_highlighted":
+        font = "Montserrat Bold" if "Montserrat" in default_font_name else default_font_name
+        outline = 4
+        shadow = 8
+        case_style = "default"
+
+    # Корректировка MarginV для аватара и Shorts
+    if is_vertical and margin_v < 120:
+        margin_v = 150
+        
+    header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: 640
 PlayResY: 360
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,{font_name},{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,3,2,0,2,24,24,{margin_v},1
+Style: Default,{font},{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,{bold},0,0,0,100,100,0,0,1,{outline},{shadow},2,24,24,{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
+    return header, case_style
 
 
 def _normalize_words(text: str):
@@ -126,6 +168,11 @@ def generate_subtitles(project_id):
     video_format = get_project_format(project_id)
     is_vertical = video_format == "short"
 
+    from database import get_project_row
+    row = get_project_row(project_id)
+    subtitle_style = row.get("subtitle_style", "default") if row else "default"
+    avatar_type = row.get("avatar_type", "none") if row else "none"
+
     project_dir = f"./storage/projects/{project_id}"
     subs_dir = f"{project_dir}/subtitles"
     os.makedirs(subs_dir, exist_ok=True)
@@ -142,9 +189,16 @@ def generate_subtitles(project_id):
     font_name, _ = _pick_subtitle_font()
     font_size = int(Config.SUBTITLE_FONT_SIZE_SHORT if is_vertical else Config.SUBTITLE_FONT_SIZE_MAIN)
     margin_v = int(Config.SUBTITLE_MARGIN_V_SHORT if is_vertical else Config.SUBTITLE_MARGIN_V_MAIN)
-    max_words = Config.SUBTITLE_MAX_WORDS_SHORT if is_vertical else Config.SUBTITLE_MAX_WORDS_MAIN
 
-    ass_header = _build_ass_header(font_name, font_size, margin_v)
+    # Subtitle placement intelligence (avoid avatar)
+    if avatar_type != "none":
+        margin_v += 80 # Lift subtitles above avatar
+
+    max_words = Config.SUBTITLE_MAX_WORDS_SHORT if is_vertical else Config.SUBTITLE_MAX_WORDS_MAIN
+    if subtitle_style in ("premium_minimal", "documentary_clean_lower"):
+        max_words = max_words + 2 # Allow longer lines for these styles
+
+    ass_header, case_style = _build_ass_header(subtitle_style, font_name, font_size, margin_v, is_vertical)
 
     for chapter in script_data:
         for scene in chapter["scenes"]:
@@ -192,6 +246,7 @@ def generate_subtitles(project_id):
             with open(ass_path, "w", encoding="utf-8") as f:
                 f.write(ass_header)
 
+                # Semantic chunking (simplified proxy: keep max_words but don't split small punctuation)
                 chunks = [timed[i : i + max_words] for i in range(0, len(timed), max_words)]
 
                 for chunk in chunks:
@@ -203,12 +258,28 @@ def generate_subtitles(project_id):
                         line_text = ""
                         for j, (w2, _, _) in enumerate(chunk):
                             clean_word = w2.strip()
+                            if case_style == "upper":
+                                clean_word = clean_word.upper()
+                            elif case_style == "lower":
+                                clean_word = clean_word.lower()
+
                             if not clean_word:
                                 continue
+                            
+                            # Highlight logic based on style
                             if j == i:
-                                line_text += f"{{\\c{hi}}}{clean_word}{{\\c&HFFFFFF&}} "
+                                if subtitle_style in ("premium_minimal", "documentary_clean_lower"):
+                                    # Very subtle or no highlight
+                                    line_text += f"{{\\c&HAAAAAA&}}{clean_word}{{\\c&HFFFFFF&}} "
+                                elif subtitle_style == "viral_big_caps":
+                                    # Aggressive pop-up
+                                    line_text += f"{{\\fscx80\\fscy80\\c{hi}\\t(0,100,\\fscx120\\fscy120)}}{clean_word}{{\\fscx100\\fscy100\\c&HFFFFFF&}} "
+                                else:
+                                    # Standard pop-up
+                                    line_text += f"{{\\fscx80\\fscy80\\c{hi}\\t(0,100,\\fscx110\\fscy110)}}{clean_word}{{\\fscx100\\fscy100\\c&HFFFFFF&}} "
                             else:
                                 line_text += f"{clean_word} "
+                                
                         if line_text.strip():
                             f.write(
                                 f"Dialogue: 0,{word_start},{word_end},Default,,0,0,0,,{line_text.strip()}\n"

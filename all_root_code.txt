@@ -1,0 +1,1262 @@
+========================================
+FILE: autopilot.py
+========================================
+
+import json
+import logging
+import time
+import schedule
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+from config import Config
+from logging_setup import configure_logging
+from modules.trend_parser import get_daily_topic, add_topic_to_queue
+
+logger = logging.getLogger(__name__)
+
+AUTOPILOT_STATE_PATH = os.path.join(Config.STORAGE_PATH, "autopilot_state.json")
+
+
+def _write_autopilot_state(next_run=None, running=True):
+    os.makedirs(Config.STORAGE_PATH, exist_ok=True)
+    payload = {
+        "running": running,
+        "next_run_iso": next_run.isoformat() if next_run else None,
+        "schedule_label": os.getenv("AUTOPILOT_SCHEDULE_LABEL", "ежедневно 03:00"),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        with open(AUTOPILOT_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        logger.warning("Не удалось записать autopilot_state.json: %s", e)
+
+
+def night_shift():
+    configure_logging(Config.STORAGE_PATH)
+    logger.info("Ночная смена автопилота")
+    topic = get_daily_topic()
+    add_topic_to_queue(topic)
+
+    logger.info("Запуск конвейера: %r", topic)
+    cmd = [sys.executable, "main.py", "--topic", topic, "--format", "short"]
+    v = (os.getenv("EDGE_TTS_CLI_VOICE") or "").strip()
+    if v:
+        cmd.extend(["--voice", v])
+    root = os.path.dirname(os.path.abspath(__file__))
+    try:
+        result = subprocess.run(cmd, cwd=root, text=True)
+        if result.returncode == 0:
+            logger.info("Ночная сборка завершена успешно")
+        else:
+            logger.error("Ночная сборка завершилась с кодом %s", result.returncode)
+    except Exception as e:
+        logger.exception("Сбой автопилота: %s", e)
+
+
+def main():
+    configure_logging(Config.STORAGE_PATH)
+    logger.info("Автопилот AI Video Studio (24/7)")
+    run_time = os.getenv("AUTOPILOT_RUN_TIME", "03:00")
+    schedule.every().day.at(run_time).do(night_shift)
+    logger.info("Расписание: каждый день в %s", run_time)
+
+    _write_autopilot_state(next_run=schedule.next_run(), running=True)
+
+    try:
+        while True:
+            schedule.run_pending()
+            _write_autopilot_state(next_run=schedule.next_run(), running=True)
+            time.sleep(60)
+    except KeyboardInterrupt:
+        logger.info("Автопилот остановлен пользователем.")
+        _write_autopilot_state(next_run=schedule.next_run(), running=False)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--now":
+        night_shift()
+    else:
+        main()
+
+
+========================================
+FILE: config.py
+========================================
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+def _normalize_llm_provider(raw: str) -> str:
+    v = (raw or "deepseek").strip().lower()
+    if v in ("deepseek", "anthropic", "openai"):
+        return v
+    return "deepseek"
+
+
+def _normalize_image_engine(raw: str) -> str:
+    v = (raw or "stock").strip().lower()
+    if v in ("google-imagen", "google_imagen", "imagen"):
+        return "google-imagen"
+    if v == "hybrid":
+        return "hybrid"
+    return "stock"
+
+
+class Config:
+    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+    ANTHROPIC_MAX_RETRIES = int(os.getenv("ANTHROPIC_MAX_RETRIES", "3"))
+    ANTHROPIC_RETRY_BASE_DELAY_SEC = float(os.getenv("ANTHROPIC_RETRY_BASE_DELAY_SEC", "1.0"))
+
+    LLM_PROVIDER = _normalize_llm_provider(os.getenv("LLM_PROVIDER", "deepseek"))
+    DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+    DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+    OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    @staticmethod
+    def has_llm_api_key():
+        """Ключ для активного LLM_PROVIDER (пустая строка = нет)."""
+        p = Config.LLM_PROVIDER
+        if p == "anthropic":
+            return bool((Config.ANTHROPIC_API_KEY or "").strip())
+        if p == "deepseek":
+            return bool((Config.DEEPSEEK_API_KEY or "").strip())
+        if p == "openai":
+            return bool((Config.OPENAI_API_KEY or "").strip())
+        return False
+
+    @staticmethod
+    def has_anthropic_api_key():
+        """Обратная совместимость: то же, что has_llm_api_key()."""
+        return Config.has_llm_api_key()
+
+    REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN", "")
+
+    PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
+    PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY", "")
+    PEXELS_HTTP_TIMEOUT_SEC = int(os.getenv("PEXELS_HTTP_TIMEOUT_SEC", "10"))
+
+    STORAGE_PATH = os.getenv("STORAGE_PATH", "./storage")
+    DB_PATH = os.path.join(STORAGE_PATH, "db.sqlite")
+    SQLITE_BUSY_TIMEOUT_SEC = float(os.getenv("SQLITE_BUSY_TIMEOUT_SEC", "30"))
+
+    # Видео (кадр)
+    VIDEO_WIDTH_SHORT = int(os.getenv("VIDEO_WIDTH_SHORT", "1080"))
+    VIDEO_HEIGHT_SHORT = int(os.getenv("VIDEO_HEIGHT_SHORT", "1920"))
+    VIDEO_WIDTH_MAIN = int(os.getenv("VIDEO_WIDTH_MAIN", "1920"))
+    VIDEO_HEIGHT_MAIN = int(os.getenv("VIDEO_HEIGHT_MAIN", "1080"))
+
+    # Озвучка (Edge-TTS). Список id для LLM и --voice — только из каталога.
+    EDGE_TTS_VOICE_CATALOG = (
+        ("ru-RU-DmitryNeural", "мужской, нейтральный — история, документалистика, факты"),
+        ("ru-RU-SvetlanaNeural", "женский, мягкий — лирика, природа, эмоциональные темы"),
+        ("ru-RU-DariyaNeural", "женский, чёткая дикция — наука, образование, динамичный тон"),
+    )
+    EDGE_TTS_VOICE_IDS = frozenset(v for v, _ in EDGE_TTS_VOICE_CATALOG)
+    EDGE_TTS_VOICE = os.getenv("EDGE_TTS_VOICE", "ru-RU-DmitryNeural")
+    EDGE_TTS_CONCURRENCY = max(1, int(os.getenv("EDGE_TTS_CONCURRENCY", "8")))
+    EDGE_TTS_DELAY_SEC = float(os.getenv("EDGE_TTS_DELAY_SEC", "1.0"))
+
+    # Движок озвучки: пусто / не google-* → Edge-TTS; google-gemini | google-chirp | google-neural2
+    TTS_ENGINE = (os.getenv("TTS_ENGINE", "") or "").strip().lower()
+    GOOGLE_TTS_VOICE = os.getenv("GOOGLE_TTS_VOICE", "Kore")
+    GOOGLE_TTS_PROMPT = os.getenv(
+        "GOOGLE_TTS_PROMPT",
+        "Speak as a documentary narrator, calm and authoritative, with dramatic pauses",
+    )
+    GOOGLE_TTS_SPEAKING_RATE = float(os.getenv("GOOGLE_TTS_SPEAKING_RATE", "1.0"))
+    GOOGLE_TTS_PITCH = float(os.getenv("GOOGLE_TTS_PITCH", "0.0"))
+    GOOGLE_TTS_MAX_RETRIES = int(os.getenv("GOOGLE_TTS_MAX_RETRIES", "3"))
+    GOOGLE_TTS_RETRY_BASE_DELAY_SEC = float(os.getenv("GOOGLE_TTS_RETRY_BASE_DELAY_SEC", "2.0"))
+
+    # Визуалы: сток (Pexels/Pixabay) или Vertex AI Imagen 3
+    IMAGE_ENGINE = _normalize_image_engine(os.getenv("IMAGE_ENGINE", "stock"))
+    GCP_PROJECT_ID = (os.getenv("GCP_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT") or "").strip()
+    GCP_LOCATION = os.getenv("GCP_LOCATION", "us-central1").strip() or "us-central1"
+    IMAGEN_MODEL = os.getenv("IMAGEN_MODEL", "imagen-3.0-generate-001").strip() or "imagen-3.0-generate-001"
+    IMAGEN_SAFETY_FILTER = os.getenv("IMAGEN_SAFETY_FILTER", "block_few").strip() or "block_few"
+
+    @staticmethod
+    def normalize_image_engine(raw):
+        """Нормализация IMAGE_ENGINE (stock / google-imagen / hybrid)."""
+        return _normalize_image_engine(raw)
+
+    @staticmethod
+    def normalize_edge_tts_voice(voice_id):
+        """Возвращает допустимый id или дефолт из EDGE_TTS_VOICE."""
+        v = (voice_id or "").strip()
+        if v in Config.EDGE_TTS_VOICE_IDS:
+            return v
+        return Config.EDGE_TTS_VOICE if Config.EDGE_TTS_VOICE in Config.EDGE_TTS_VOICE_IDS else next(iter(Config.EDGE_TTS_VOICE_IDS))
+
+    @staticmethod
+    def edge_tts_voice_catalog_text():
+        return "\n".join(f'    "{vid}": {desc}' for vid, desc in Config.EDGE_TTS_VOICE_CATALOG)
+
+    # Whisper / субтитры (Alignment=2 низ, MarginV — отступ от нижнего края)
+    # whisper — таймкоды через Whisper; proportional — только текст сценария, без Whisper (меньше RAM)
+    SUBTITLE_ENGINE = (os.getenv("SUBTITLE_ENGINE", "whisper") or "whisper").strip().lower()
+    WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
+    SUBTITLE_FONT_SIZE_SHORT = os.getenv("SUBTITLE_FONT_SIZE_SHORT", "34")
+    SUBTITLE_FONT_SIZE_MAIN = os.getenv("SUBTITLE_FONT_SIZE_MAIN", "22")
+    SUBTITLE_MARGIN_V_SHORT = os.getenv("SUBTITLE_MARGIN_V_SHORT", "72")
+    SUBTITLE_MARGIN_V_MAIN = os.getenv("SUBTITLE_MARGIN_V_MAIN", "48")
+    SUBTITLE_MAX_WORDS_SHORT = int(os.getenv("SUBTITLE_MAX_WORDS_SHORT", "3"))
+    SUBTITLE_MAX_WORDS_MAIN = int(os.getenv("SUBTITLE_MAX_WORDS_MAIN", "6"))
+
+    # Монтаж / SFX (xfade между сценами; чёрный зазор между главами)
+    SCENE_TAIL_SILENCE_SEC = float(os.getenv("SCENE_TAIL_SILENCE_SEC", "0.8"))
+    SCENE_FADE_OUT_LEAD_SEC = float(os.getenv("SCENE_FADE_OUT_LEAD_SEC", "0.5"))
+    SCENE_FADE_IN_SEC = float(os.getenv("SCENE_FADE_IN_SEC", "0.5"))
+    SCENE_XFADE_EVEN_SEC = float(os.getenv("SCENE_XFADE_EVEN_SEC", "0.3"))
+    SCENE_XFADE_ODD_SEC = float(os.getenv("SCENE_XFADE_ODD_SEC", "0.5"))
+    SCENE_XFADE_FAST_SEC = float(os.getenv("SCENE_XFADE_FAST_SEC", "0.15"))
+    CHAPTER_GAP_BLACK_SEC = float(os.getenv("CHAPTER_GAP_BLACK_SEC", "0.5"))
+    STOCK_DOWNLOAD_TIMEOUT_SEC = int(os.getenv("STOCK_DOWNLOAD_TIMEOUT_SEC", "30"))
+    STOCK_MIN_FPS = float(os.getenv("STOCK_MIN_FPS", "15"))
+    # ffprobe: отсев слайдшоу/статики (байт/сек по размеру файла)
+    STOCK_MIN_BYTES_PER_SEC = float(os.getenv("STOCK_MIN_BYTES_PER_SEC", "200000"))
+    SFX_IMPACT_VOLUME = os.getenv("SFX_IMPACT_VOLUME", "0.5")
+    SFX_WHOOSH_VOLUME = os.getenv("SFX_WHOOSH_VOLUME", "0.3")
+    MOOD_SFX_IMPACT = frozenset(
+        s.strip().lower()
+        for s in os.getenv("MOOD_SFX_IMPACT", "epic,dramatic,tense,action").split(",")
+        if s.strip()
+    )
+
+    # Гибридный движок видео
+    VIDEO_GENERATOR_PROFILES_COUNT = max(1, int(os.getenv("VIDEO_GENERATOR_PROFILES_COUNT", "3")))
+
+    # Аудио-мастеринг (фон)
+    BG_MUSIC_VOLUME = float(os.getenv("BG_MUSIC_VOLUME", "0.4"))
+    SIDECHAIN_THRESHOLD = os.getenv("SIDECHAIN_THRESHOLD", "0.08")
+    SIDECHAIN_RATIO = os.getenv("SIDECHAIN_RATIO", "4")
+    SIDECHAIN_ATTACK = os.getenv("SIDECHAIN_ATTACK", "5")
+    SIDECHAIN_RELEASE = os.getenv("SIDECHAIN_RELEASE", "50")
+
+    # Веб-дашборд (FastAPI)
+    DASHBOARD_HOST = os.getenv("DASHBOARD_HOST", "127.0.0.1")
+    DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "8000"))
+    TOPICS_QUEUE_FILE = os.getenv("TOPICS_QUEUE_FILE", "topics.txt")
+    REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+    FONTS_DIR = os.path.join(STORAGE_PATH, "fonts")
+    SUBTITLE_FONTS_DIR = FONTS_DIR
+
+    os.makedirs(STORAGE_PATH, exist_ok=True)
+    os.makedirs(FONTS_DIR, exist_ok=True)
+
+
+========================================
+FILE: database.py
+========================================
+
+import logging
+import sqlite3
+from config import Config
+
+logger = logging.getLogger(__name__)
+
+
+class ScriptDataError(ValueError):
+    """Сценарий проекта пустой или без сцен — дальнейшие шаги бессмысленны."""
+
+
+PIPELINE_STEPS = ("script", "voice", "videos", "subtitles", "montage", "audio", "seo")
+
+
+def get_connection():
+    conn = sqlite3.connect(Config.DB_PATH, timeout=Config.SQLITE_BUSY_TIMEOUT_SEC)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def init_db():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.executescript('''
+    CREATE TABLE IF NOT EXISTS projects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        status TEXT DEFAULT 'created',
+        format TEXT NOT NULL,
+        preset TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS chapters (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER,
+        number INTEGER,
+        title TEXT,
+        status TEXT DEFAULT 'pending',
+        FOREIGN KEY(project_id) REFERENCES projects(id)
+    );
+    CREATE TABLE IF NOT EXISTS scenes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chapter_id INTEGER,
+        number INTEGER,
+        narration TEXT,
+        image_prompt TEXT,
+        mood TEXT,
+        camera TEXT,
+        duration_sec REAL,
+        audio_path TEXT,
+        FOREIGN KEY(chapter_id) REFERENCES chapters(id)
+    );
+    CREATE TABLE IF NOT EXISTS checkpoints (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER,
+        step TEXT,
+        status TEXT,
+        FOREIGN KEY(project_id) REFERENCES projects(id)
+    );
+    ''')
+    try:
+        cursor.execute("ALTER TABLE scenes ADD COLUMN audio_path TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE projects ADD COLUMN tts_voice TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE projects ADD COLUMN error_message TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE projects ADD COLUMN tts_engine TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE projects ADD COLUMN tts_prompt TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE projects ADD COLUMN image_engine TEXT")
+    except sqlite3.OperationalError:
+        pass
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS tts_usage_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER,
+        scene_id INTEGER,
+        engine TEXT,
+        model TEXT,
+        voice TEXT,
+        chars_count INTEGER,
+        duration_sec REAL,
+        estimated_cost_usd REAL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(project_id) REFERENCES projects(id)
+    );
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS llm_usage_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER,
+        step TEXT,
+        provider TEXT,
+        model TEXT,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        estimated_cost_usd REAL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(project_id) REFERENCES projects(id)
+    );
+    """)
+    conn.commit()
+    conn.close()
+
+
+def create_project(
+    title,
+    format_type,
+    preset,
+    tts_voice=None,
+    tts_engine=None,
+    image_engine=None,
+):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id FROM projects WHERE title = ? AND status != 'completed' ORDER BY id DESC LIMIT 1",
+        (title,),
+    )
+    row = cursor.fetchone()
+    te = str(tts_engine).strip().lower() if tts_engine is not None else None
+    ie = Config.normalize_image_engine(image_engine) if image_engine is not None else None
+
+    if row:
+        project_id = row[0]
+        sets = []
+        params = []
+        if tts_voice is not None:
+            sets.append("tts_voice = ?")
+            params.append(tts_voice)
+        if te is not None:
+            sets.append("tts_engine = ?")
+            params.append(te)
+        if ie is not None:
+            sets.append("image_engine = ?")
+            params.append(ie)
+        if sets:
+            params.append(project_id)
+            cursor.execute(f"UPDATE projects SET {', '.join(sets)} WHERE id = ?", params)
+            conn.commit()
+        conn.close()
+        return project_id
+
+    cursor.execute(
+        "INSERT INTO projects (title, format, preset, tts_voice, tts_engine, image_engine) VALUES (?, ?, ?, ?, ?, ?)",
+        (title, format_type, preset, tts_voice, te, ie),
+    )
+    project_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return project_id
+
+def get_project_format(project_id):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT format FROM projects WHERE id = ?", (project_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else "main"
+
+
+def get_project_tts_engine(project_id):
+    """Движок TTS проекта или глобальный TTS_ENGINE из Config."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT tts_engine FROM projects WHERE id = ?", (project_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row and row[0] and str(row[0]).strip():
+        return str(row[0]).strip().lower()
+    return (Config.TTS_ENGINE or "").strip().lower()
+
+
+def update_project_tts_engine(project_id, engine: str):
+    e = str(engine or "").strip().lower()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE projects SET tts_engine = ? WHERE id = ?", (e, project_id))
+    conn.commit()
+    conn.close()
+    return e
+
+
+def get_project_image_engine(project_id):
+    """Режим картинок/стока проекта или IMAGE_ENGINE из Config."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT image_engine FROM projects WHERE id = ?", (project_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row and row[0] and str(row[0]).strip():
+        return Config.normalize_image_engine(row[0])
+    return Config.IMAGE_ENGINE
+
+
+def update_project_image_engine(project_id, image_engine: str):
+    eng = Config.normalize_image_engine(image_engine)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE projects SET image_engine = ? WHERE id = ?", (eng, project_id))
+    conn.commit()
+    conn.close()
+    return eng
+
+
+def get_project_tts_prompt(project_id):
+    """Стилевой промпт для Gemini TTS или дефолт из Config."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT tts_prompt FROM projects WHERE id = ?", (project_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row and row[0] and str(row[0]).strip():
+        return str(row[0]).strip()
+    return Config.GOOGLE_TTS_PROMPT
+
+
+def get_project_tts_voice(project_id):
+    """Сохранённый голос: для Google — как в БД/Config; для Edge — нормализация каталога."""
+    engine = get_project_tts_engine(project_id)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT tts_voice FROM projects WHERE id = ?", (project_id,))
+    row = cursor.fetchone()
+    conn.close()
+    raw = row[0] if row and row[0] else None
+    if engine.startswith("google-"):
+        v = (raw or Config.GOOGLE_TTS_VOICE or "Kore").strip()
+        return v
+    if raw:
+        return Config.normalize_edge_tts_voice(raw)
+    return Config.normalize_edge_tts_voice(Config.EDGE_TTS_VOICE)
+
+
+def update_project_tts_voice(project_id, voice_id):
+    v = Config.normalize_edge_tts_voice(voice_id)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE projects SET tts_voice = ? WHERE id = ?", (v, project_id))
+    conn.commit()
+    conn.close()
+    return v
+
+
+def log_tts_usage(
+    project_id,
+    scene_id,
+    engine,
+    model,
+    voice,
+    chars_count,
+    duration_sec,
+    estimated_cost_usd,
+):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO tts_usage_log (
+            project_id, scene_id, engine, model, voice,
+            chars_count, duration_sec, estimated_cost_usd
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            project_id,
+            scene_id,
+            engine,
+            model,
+            voice,
+            chars_count,
+            duration_sec,
+            float(estimated_cost_usd),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def log_llm_usage(
+    project_id,
+    step,
+    provider,
+    model,
+    input_tokens,
+    output_tokens,
+    estimated_cost_usd,
+):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO llm_usage_log (
+            project_id, step, provider, model,
+            input_tokens, output_tokens, estimated_cost_usd
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            project_id,
+            step,
+            provider,
+            model,
+            int(input_tokens or 0),
+            int(output_tokens or 0),
+            float(estimated_cost_usd or 0),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def sum_llm_usage_estimated_usd_for_project(project_id):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT COALESCE(SUM(estimated_cost_usd), 0) FROM llm_usage_log WHERE project_id = ?",
+        (project_id,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return float(row[0] or 0) if row else 0.0
+
+
+def has_checkpoint(project_id, step):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM checkpoints WHERE project_id = ? AND step = ? AND status = 'done'", (project_id, step))
+    row = cursor.fetchone()
+    conn.close()
+    return bool(row)
+
+def save_checkpoint(project_id, step):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO checkpoints (project_id, step, status) VALUES (?, ?, 'done')", (project_id, step))
+    conn.commit()
+    conn.close()
+
+def mark_project_completed(project_id):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE projects SET status = 'completed', error_message = NULL WHERE id = ?", (project_id,))
+    conn.commit()
+    conn.close()
+
+
+def mark_project_processing(project_id):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE projects SET status = 'processing', error_message = NULL WHERE id = ?",
+        (project_id,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def mark_project_failed(project_id, message: str):
+    msg = (message or "")[:4000]
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE projects SET status = 'failed', error_message = ? WHERE id = ?",
+        (msg, project_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def insert_dashboard_project(title, format_type, tts_voice=None):
+    """Новая строка проекта для дашборда (без дедупликации по названию)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO projects (title, format, preset, status, tts_voice) VALUES (?, ?, 'default', 'pending', ?)",
+        (title, format_type, tts_voice),
+    )
+    project_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return project_id
+
+
+def get_project_row(project_id):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """SELECT id, title, status, format, preset, tts_voice, created_at, error_message
+           FROM projects WHERE id = ?""",
+        (project_id,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "title": row[1],
+        "status": row[2],
+        "format": row[3],
+        "preset": row[4],
+        "tts_voice": row[5],
+        "created_at": row[6],
+        "error_message": row[7],
+    }
+
+
+def get_checkpoint_steps(project_id):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT step FROM checkpoints WHERE project_id = ? AND status = 'done' ORDER BY id",
+        (project_id,),
+    )
+    steps = [r[0] for r in cursor.fetchall()]
+    conn.close()
+    return steps
+
+
+def derive_project_ui_status(row, checkpoint_steps):
+    """Унифицированный статус для UI: completed | failed | processing | pending | queued."""
+    st = row["status"] or "created"
+    cps = set(checkpoint_steps)
+    if st == "completed":
+        return "completed"
+    if st == "failed":
+        return "failed"
+    if st == "processing":
+        return "processing"
+    if st == "pending":
+        return "queued"
+    if st == "created" and cps:
+        return "processing"
+    if st == "created":
+        return "pending"
+    return "pending"
+
+
+def get_current_pipeline_step(checkpoint_steps):
+    """Следующий шаг после последнего чекпоинта (или первый, если пусто)."""
+    done = set(checkpoint_steps)
+    for s in PIPELINE_STEPS:
+        if s not in done:
+            return s
+    return None
+
+
+def list_projects_paginated(
+    page=1,
+    page_size=20,
+    status_filter=None,
+    format_filter=None,
+    search=None,
+    sort_desc=True,
+):
+    """
+    status_filter: all | completed | failed | processing | queued | pending
+    queued = только status pending (дашборд, ещё не стартовал)
+    pending = created без чекпоинтов (старый CLI)
+    processing = processing или created с чекпоинтами
+    """
+    page = max(1, int(page))
+    page_size = min(100, max(1, int(page_size)))
+    offset = (page - 1) * page_size
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    where = ["1=1"]
+    params = []
+
+    if format_filter and format_filter in ("short", "main", "long"):
+        where.append("p.format = ?")
+        params.append(format_filter)
+
+    if search and search.strip():
+        where.append("p.title LIKE ?")
+        params.append(f"%{search.strip()}%")
+
+    if status_filter and status_filter != "all":
+        if status_filter == "completed":
+            where.append("p.status = 'completed'")
+        elif status_filter == "failed":
+            where.append("p.status = 'failed'")
+        elif status_filter == "queued":
+            where.append("p.status = 'pending'")
+        elif status_filter == "pending":
+            where.append(
+                """p.status = 'created' AND NOT EXISTS (
+                SELECT 1 FROM checkpoints c WHERE c.project_id = p.id)"""
+            )
+        elif status_filter == "processing":
+            where.append(
+                """(
+                p.status = 'processing'
+                OR (p.status = 'created' AND EXISTS (SELECT 1 FROM checkpoints c WHERE c.project_id = p.id))
+            )"""
+            )
+
+    where_sql = " AND ".join(where)
+    order = "DESC" if sort_desc else "ASC"
+
+    cursor.execute(f"SELECT COUNT(*) FROM projects p WHERE {where_sql}", params)
+    total = cursor.fetchone()[0]
+
+    cursor.execute(
+        f"""
+        SELECT p.id, p.title, p.status, p.format, p.tts_voice, p.created_at, p.error_message
+        FROM projects p
+        WHERE {where_sql}
+        ORDER BY p.created_at {order}
+        LIMIT ? OFFSET ?
+        """,
+        params + [page_size, offset],
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    items = []
+    for r in rows:
+        pid = r[0]
+        row_dict = {
+            "id": r[0],
+            "title": r[1],
+            "status": r[2],
+            "format": r[3],
+            "tts_voice": r[4],
+            "created_at": r[5],
+            "error_message": r[6],
+        }
+        cps = get_checkpoint_steps(pid)
+        items.append(
+            {
+                **row_dict,
+                "ui_status": derive_project_ui_status(row_dict, cps),
+                "checkpoints": cps,
+                "current_step": get_current_pipeline_step(cps)
+                if row_dict["status"] not in ("completed", "failed")
+                else None,
+            }
+        )
+    return {"total": total, "page": page, "page_size": page_size, "items": items}
+
+
+def count_projects_stats():
+    """Сводные числа для дашборда."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM projects")
+    total = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM projects WHERE status = 'completed'")
+    completed = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM projects WHERE status = 'failed'")
+    failed = cursor.fetchone()[0]
+    cursor.execute(
+        """
+        SELECT COUNT(*) FROM projects p
+        WHERE p.status NOT IN ('completed', 'failed')
+        AND (
+            p.status = 'processing'
+            OR p.status = 'pending'
+            OR (p.status = 'created' AND EXISTS (SELECT 1 FROM checkpoints c WHERE c.project_id = p.id))
+        )
+        """
+    )
+    in_progress = cursor.fetchone()[0]
+    conn.close()
+    return {
+        "total": total,
+        "completed": completed,
+        "failed": failed,
+        "in_progress": in_progress,
+    }
+
+
+def save_script_to_db(project_id, script_data):
+    conn = get_connection()
+    cursor = conn.cursor()
+    for chapter in script_data.get('chapters', []):
+        cursor.execute("INSERT INTO chapters (project_id, number, title) VALUES (?, ?, ?)",
+                       (project_id, chapter['chapter_number'], chapter['chapter_title']))
+        chapter_id = cursor.lastrowid
+        for scene in chapter.get('scenes', []):
+            cursor.execute('''INSERT INTO scenes (chapter_id, number, narration, image_prompt, mood, camera, duration_sec)
+                              VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                           (chapter_id, scene['scene_number'], scene['narration'], scene['image_prompt'], 
+                            scene['mood'], scene['camera'], scene['duration_sec']))
+    conn.commit()
+    conn.close()
+
+
+def validate_script_data(script_data):
+    """Возвращает (ok, сообщение_об_ошибке)."""
+    if not script_data:
+        return False, "нет глав в сценарии"
+    total = sum(len(ch.get("scenes") or []) for ch in script_data)
+    if total == 0:
+        return False, "нет ни одной сцены"
+    return True, ""
+
+
+def get_project_script(project_id, require_scenes=True):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, number, title FROM chapters WHERE project_id = ? ORDER BY number", (project_id,))
+    chapters = cursor.fetchall()
+    result = []
+    for ch_id, ch_num, ch_title in chapters:
+        cursor.execute(
+            """SELECT id, number, narration, image_prompt, mood, camera, duration_sec
+               FROM scenes WHERE chapter_id = ? ORDER BY number""",
+            (ch_id,),
+        )
+        scenes_raw = cursor.fetchall()
+        scenes = [
+            {
+                "id": r[0],
+                "number": r[1],
+                "narration": r[2],
+                "image_prompt": r[3],
+                "mood": r[4],
+                "camera": r[5],
+                "duration_sec": r[6],
+            }
+            for r in scenes_raw
+        ]
+        result.append({"id": ch_id, "number": ch_num, "title": ch_title, "scenes": scenes})
+    conn.close()
+    if require_scenes:
+        ok, err = validate_script_data(result)
+        if not ok:
+            logger.error("Проект %s: сценарий невалиден: %s", project_id, err)
+            raise ScriptDataError(f"Проект {project_id}: сценарий невалиден ({err})")
+    return result
+
+def update_scene_audio(scene_id, path):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE scenes SET audio_path = ? WHERE id = ?", (path, scene_id))
+    conn.commit()
+    conn.close()
+
+
+========================================
+FILE: docker-compose.yml
+========================================
+
+# Дашборд: http://localhost:8000
+# Хранилище и .env монтируются с хоста.
+
+services:
+  dashboard:
+    build: .
+    command: uvicorn dashboard.api:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./storage:/app/storage
+      - ./.env:/app/.env:ro
+    working_dir: /app
+    environment:
+      - WHISPER_CACHE_DIR=/app/storage/whisper_cache
+
+
+========================================
+FILE: Dockerfile
+========================================
+
+# Сборка: docker build -t ai-video-studio .
+# Запуск (пример): docker run --rm -v "%cd%/storage:/app/storage" -v "%cd%/.env:/app/.env:ro" ai-video-studio python main.py --topic "Тема" --format short
+#
+# В контейнере нет интерактивного Chrome для ручной выгрузки ИИ-видео; для шага «гибридного» движка
+# установлен Chromium (ищется через PATH). Для OAuth YouTube смонтируйте client_secrets.json и пробросьте порт при необходимости.
+
+FROM python:3.11-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    fonts-dejavu-core \
+    fonts-liberation \
+    fontconfig \
+    chromium \
+    && fc-cache -f \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --upgrade pip && pip install -r requirements.txt
+
+COPY . .
+
+# Тонкие модели Whisper при первом запуске качаются в кэш пользователя
+ENV WHISPER_CACHE_DIR=/app/storage/whisper_cache
+
+EXPOSE 8000
+
+# По умолчанию справка CLI; в docker-compose переопределите command на uvicorn (дашборд).
+CMD ["python", "main.py", "--help"]
+
+
+========================================
+FILE: logging_setup.py
+========================================
+
+"""Единая настройка логирования (файл + консоль) для main, autopilot, бота."""
+
+import logging
+import os
+
+_configured = False
+
+
+def configure_logging(storage_path: str) -> None:
+    global _configured
+    if _configured:
+        return
+    log_dir = os.path.join(storage_path, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "pipeline.log")
+    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter(fmt))
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(logging.Formatter(fmt))
+    root.handlers.clear()
+    root.addHandler(fh)
+    root.addHandler(sh)
+    _configured = True
+
+
+========================================
+FILE: main.py
+========================================
+
+import argparse
+import logging
+import sys
+from config import Config
+from database import (
+    ScriptDataError,
+    create_project,
+    get_project_row,
+    get_project_tts_voice,
+    has_checkpoint,
+    init_db,
+    mark_project_completed,
+    mark_project_failed,
+    mark_project_processing,
+    save_checkpoint,
+    update_project_image_engine,
+    update_project_tts_engine,
+)
+from logging_setup import configure_logging
+from modules.script_generator import generate_script
+from modules.voiceover import generate_voiceover
+from modules.video_generator import generate_videos
+from modules.subtitles import generate_subtitles
+from modules.montage import render_project
+from modules.audio_engine import add_background_music
+from modules.seo_generator import generate_seo
+from modules.cleanup import cleanup_project_temp_files
+from modules.pipeline_checks import (
+    validate_after_subtitles,
+    validate_after_videos,
+    validate_after_voice,
+)
+
+logger = logging.getLogger(__name__)
+
+_STEP_VALIDATORS = {
+    "voice": validate_after_voice,
+    "videos": validate_after_videos,
+    "subtitles": validate_after_subtitles,
+}
+
+
+def run_step(step_name, func, project_id, *args):
+    if has_checkpoint(project_id, step_name):
+        logger.info("Шаг «%s» уже отмечен выполненным (checkpoint), project_id=%s", step_name, project_id)
+        return True
+    ok = func(project_id, *args)
+    if ok:
+        vfn = _STEP_VALIDATORS.get(step_name)
+        if vfn:
+            vok, verr = vfn(project_id)
+            if not vok:
+                logger.error(
+                    "Проверка после шага «%s» не прошла (project_id=%s): %s — checkpoint не записан",
+                    step_name,
+                    project_id,
+                    verr,
+                )
+                return False
+        save_checkpoint(project_id, step_name)
+        logger.info("Шаг «%s» выполнен, checkpoint сохранён, project_id=%s", step_name, project_id)
+        return True
+    logger.error(
+        "Шаг «%s» вернул False (сбой без исключения), project_id=%s — checkpoint не записан",
+        step_name,
+        project_id,
+    )
+    return False
+
+
+def run_pipeline_steps(
+    project_id,
+    topic,
+    format_type,
+    pure_stock=False,
+    cli_voice=None,
+    tts_engine=None,
+    image_engine=None,
+):
+    """Выполняет все шаги конвейера для существующего project_id."""
+    if tts_engine is not None:
+        update_project_tts_engine(project_id, tts_engine)
+    if image_engine is not None:
+        update_project_image_engine(project_id, image_engine)
+    mark_project_processing(project_id)
+    logger.info("СТАРТ ПРОЕКТА id=%s: %s (формат: %s, голос CLI: %s)", project_id, topic, format_type, cli_voice or "—")
+
+    try:
+        if not run_step(
+            "script",
+            generate_script,
+            project_id,
+            topic,
+            format_type,
+            False,
+            cli_voice,
+        ):
+            raise RuntimeError("Ошибка скрипта")
+        if not run_step("voice", generate_voiceover, project_id):
+            raise RuntimeError("Ошибка голоса")
+
+        if not run_step("videos", generate_videos, project_id, pure_stock):
+            raise RuntimeError("Ошибка видео")
+
+        if not run_step("subtitles", generate_subtitles, project_id):
+            raise RuntimeError("Ошибка субтитров")
+        if not run_step("montage", render_project, project_id):
+            raise RuntimeError("Ошибка монтажа")
+        if not run_step("audio", add_background_music, project_id):
+            raise RuntimeError("Ошибка звука")
+        if not run_step("seo", generate_seo, project_id, topic):
+            raise RuntimeError("Ошибка SEO")
+
+        cleanup_project_temp_files(project_id)
+        mark_project_completed(project_id)
+        logger.info("ПРОЕКТ id=%s '%s' ПОЛНОСТЬЮ ЗАВЕРШЁН", project_id, topic)
+        return True
+    except ScriptDataError as e:
+        logger.error("Сценарий project_id=%s: %s", project_id, e)
+        mark_project_failed(project_id, str(e))
+        print(f"\n[X] ОШИБКА СЦЕНАРИЯ: {e}")
+        return False
+    except Exception as e:
+        logger.exception("Пайплайн project_id=%s прерван: %s", project_id, e)
+        mark_project_failed(project_id, str(e))
+        print(f"\n[X] ОШИБКА: {e}")
+        return False
+
+
+def run_pipeline(
+    topic,
+    format_type,
+    pure_stock=False,
+    cli_voice=None,
+    tts_engine=None,
+    image_engine=None,
+):
+    """CLI: создаёт проект (с дедупликацией по названию) и запускает конвейер."""
+    project_id = create_project(
+        topic,
+        format_type,
+        "default",
+        tts_voice=cli_voice,
+        tts_engine=tts_engine,
+        image_engine=image_engine,
+    )
+    return run_pipeline_steps(
+        project_id,
+        topic,
+        format_type,
+        pure_stock,
+        cli_voice,
+        tts_engine,
+        image_engine,
+    )
+
+
+def run_pipeline_by_project_id(
+    project_id,
+    pure_stock=False,
+    tts_engine=None,
+    image_engine=None,
+):
+    """Запуск по id (дашборд): строка проекта уже есть в БД."""
+    row = get_project_row(project_id)
+    if not row:
+        logger.error("Проект id=%s не найден", project_id)
+        return False
+    if row["status"] == "completed":
+        logger.info("Проект id=%s уже завершён — пропуск", project_id)
+        return True
+    topic = row["title"]
+    format_type = row["format"]
+    voice_row = row.get("tts_voice")
+    cli_voice = voice_row if voice_row else None
+    return run_pipeline_steps(
+        project_id,
+        topic,
+        format_type,
+        pure_stock,
+        cli_voice,
+        tts_engine,
+        image_engine,
+    )
+
+
+def main():
+    configure_logging(Config.STORAGE_PATH)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--topic", type=str)
+    parser.add_argument("--format", type=str, choices=["short", "main", "long"], default="short")
+    parser.add_argument("--pure-stock", action="store_true", help="Использовать ТОЛЬКО сток видео (без ИИ)")
+    parser.add_argument(
+        "--voice",
+        type=str,
+        default=None,
+        choices=sorted(Config.EDGE_TTS_VOICE_IDS),
+        metavar="VOICE_ID",
+        help="Голос Edge-TTS (перекрывает выбор LLM). См. EDGE_TTS_VOICE_CATALOG в config.py",
+    )
+    parser.add_argument("--project-id", type=int, default=None, help="Запуск конвейера для существующего проекта (дашборд)")
+    parser.add_argument(
+        "--tts-engine",
+        type=str,
+        default=None,
+        choices=["edge", "google-gemini", "google-chirp", "google-neural2"],
+        help="Движок озвучки в БД для проекта (перекрывает TTS_ENGINE из .env)",
+    )
+    parser.add_argument(
+        "--image-engine",
+        type=str,
+        default=None,
+        choices=["stock", "google-imagen", "hybrid"],
+        help="Источник визуала в БД для проекта (перекрывает IMAGE_ENGINE из .env)",
+    )
+    parser.add_argument("--init-db", action="store_true")
+    args = parser.parse_args()
+
+    if args.init_db:
+        init_db()
+        logger.info("База данных инициализирована")
+        return
+
+    if args.project_id is not None:
+        ok = run_pipeline_by_project_id(
+            args.project_id,
+            args.pure_stock,
+            tts_engine=args.tts_engine,
+            image_engine=args.image_engine,
+        )
+        sys.exit(0 if ok else 1)
+
+    if args.topic:
+        ok = run_pipeline(
+            args.topic,
+            args.format,
+            args.pure_stock,
+            cli_voice=args.voice,
+            tts_engine=args.tts_engine,
+            image_engine=args.image_engine,
+        )
+        sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()
+
+

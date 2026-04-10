@@ -68,6 +68,16 @@ def run_step(step_name, func, project_id, *args):
     return False
 
 
+def check_manual_review_status(project_id) -> bool:
+    """Возвращает True, если есть сцены, ожидающие ручного ревью или ретрая."""
+    from database import get_connection
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM scenes c JOIN chapters ch ON c.chapter_id = ch.id WHERE ch.project_id = ? AND c.scene_status IN ('needs_review', 'retry_pending')", (project_id,))
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count > 0
+
 def run_pipeline_steps(
     project_id,
     topic,
@@ -85,6 +95,10 @@ def run_pipeline_steps(
     mark_project_processing(project_id)
     logger.info("СТАРТ ПРОЕКТА id=%s: %s (формат: %s, голос CLI: %s)", project_id, topic, format_type, cli_voice or "—")
 
+    from database import get_project_row
+    row = get_project_row(project_id)
+    keep_intermediates = row.get("keep_intermediates", False) if row else False
+
     try:
         if not run_step(
             "script",
@@ -96,11 +110,22 @@ def run_pipeline_steps(
             cli_voice,
         ):
             raise RuntimeError("Ошибка скрипта")
+            
+        # Voice generation
         if not run_step("voice", generate_voiceover, project_id):
             raise RuntimeError("Ошибка голоса")
 
+        # Video generation & QC validation
         if not run_step("videos", generate_videos, project_id, pure_stock):
-            raise RuntimeError("Ошибка видео")
+            raise RuntimeError("Ошибка видео (Visual QC не пройдена)")
+
+        # STOP for manual review if required and any scene is marked as needs_review
+        if check_manual_review_status(project_id):
+            msg = "Пайплайн приостановлен: есть сцены с низким скором. Ожидается ручное ревью (manual_review_required=1)."
+            logger.warning(msg)
+            from database import mark_project_paused_for_review
+            mark_project_paused_for_review(project_id, msg)
+            return False
 
         if not run_step("subtitles", generate_subtitles, project_id):
             raise RuntimeError("Ошибка субтитров")
@@ -111,7 +136,11 @@ def run_pipeline_steps(
         if not run_step("seo", generate_seo, project_id, topic):
             raise RuntimeError("Ошибка SEO")
 
-        cleanup_project_temp_files(project_id)
+        if not keep_intermediates:
+            cleanup_project_temp_files(project_id)
+        else:
+            logger.info("Пропуск очистки временных файлов: keep_intermediates=1")
+            
         mark_project_completed(project_id)
         logger.info("ПРОЕКТ id=%s '%s' ПОЛНОСТЬЮ ЗАВЕРШЁН", project_id, topic)
         return True
@@ -121,8 +150,11 @@ def run_pipeline_steps(
         print(f"\n[X] ОШИБКА СЦЕНАРИЯ: {e}")
         return False
     except Exception as e:
-        logger.exception("Пайплайн project_id=%s прерван: %s", project_id, e)
-        mark_project_failed(project_id, str(e))
+        import traceback
+        tb_str = traceback.format_exc()
+        logger.exception("❌ ОШИБКА ПАЙПЛАЙНА для проекта %s:\n%s", project_id, tb_str)
+        # Записываем в БД полную ошибку с Traceback, обрезаем до 4000 символов
+        mark_project_failed(project_id, f"{str(e)}\n\n{tb_str}"[:4000])
         print(f"\n[X] ОШИБКА: {e}")
         return False
 
@@ -134,6 +166,12 @@ def run_pipeline(
     cli_voice=None,
     tts_engine=None,
     image_engine=None,
+    style_preset=None,
+    subtitle_style=None,
+    voice_profile=None,
+    quality_mode=None,
+    keep_intermediates=False,
+    review_required=False,
 ):
     """CLI: создаёт проект (с дедупликацией по названию) и запускает конвейер."""
     project_id = create_project(
@@ -144,6 +182,36 @@ def run_pipeline(
         tts_engine=tts_engine,
         image_engine=image_engine,
     )
+
+    # Save new settings directly into the database
+    from database import get_connection
+    conn = get_connection()
+    cursor = conn.cursor()
+    updates = []
+    params = []
+    if style_preset:
+        updates.append("style_preset = ?")
+        params.append(style_preset)
+    if subtitle_style:
+        updates.append("subtitle_style = ?")
+        params.append(subtitle_style)
+    if voice_profile:
+        updates.append("voice_profile = ?")
+        params.append(voice_profile)
+    if quality_mode:
+        updates.append("quality_mode = ?")
+        params.append(quality_mode)
+    if keep_intermediates:
+        updates.append("keep_intermediates = 1")
+    if review_required:
+        updates.append("manual_review_required = 1")
+
+    if updates:
+        params.append(project_id)
+        cursor.execute(f"UPDATE projects SET {', '.join(updates)} WHERE id = ?", params)
+        conn.commit()
+    conn.close()
+
     return run_pipeline_steps(
         project_id,
         topic,
@@ -214,12 +282,34 @@ def main():
         choices=["stock", "google-imagen", "hybrid"],
         help="Источник визуала в БД для проекта (перекрывает IMAGE_ENGINE из .env)",
     )
+    parser.add_argument("--style-preset", type=str, choices=Config.STYLE_PRESETS, help="Стиль генерации сценария")
+    parser.add_argument("--subtitle-style", type=str, choices=Config.SUBTITLE_STYLES, help="Стиль генерации субтитров")
+    parser.add_argument("--voice-profile", type=str, choices=Config.VOICE_PROFILES, help="Профиль обработки голоса")
+    parser.add_argument("--quality-mode", type=str, choices=["draft", "standard", "premium"], help="Режим качества (оценка сцен)")
+    parser.add_argument("--keep-intermediates", action="store_true", help="Оставлять временные файлы (для отладки)")
+    parser.add_argument("--review-required", action="store_true", help="Останавливать перед финальным рендером для проверки")
+    parser.add_argument("--regenerate-scene", type=int, help="Перегенерировать конкретную сцену и выйти")
     parser.add_argument("--init-db", action="store_true")
     args = parser.parse_args()
 
     if args.init_db:
         init_db()
         logger.info("База данных инициализирована")
+        return
+
+    import os
+    if args.regenerate_scene and args.project_id:
+        target = os.environ.get("REGENERATE_TARGET", "voice")
+        logger.info("Перегенерация сцены %s (таргет: %s) для проекта %s", args.regenerate_scene, target, args.project_id)
+        from database import update_scene_fields
+        if target == "voice":
+            from modules.voiceover import generate_voiceover
+            generate_voiceover(args.project_id, specific_scene_id=args.regenerate_scene)
+            update_scene_fields(args.regenerate_scene, {"scene_status": "approved"})
+        elif target == "visual":
+            from modules.video_generator import generate_videos
+            generate_videos(args.project_id, args.pure_stock, specific_scene_id=args.regenerate_scene)
+            update_scene_fields(args.regenerate_scene, {"scene_status": "approved"})
         return
 
     if args.project_id is not None:
@@ -239,6 +329,12 @@ def main():
             cli_voice=args.voice,
             tts_engine=args.tts_engine,
             image_engine=args.image_engine,
+            style_preset=args.style_preset,
+            subtitle_style=args.subtitle_style,
+            voice_profile=args.voice_profile,
+            quality_mode=args.quality_mode,
+            keep_intermediates=args.keep_intermediates,
+            review_required=args.review_required,
         )
         sys.exit(0 if ok else 1)
 

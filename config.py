@@ -15,12 +15,64 @@ def _normalize_image_engine(raw: str) -> str:
     v = (raw or "stock").strip().lower()
     if v in ("google-imagen", "google_imagen", "imagen"):
         return "google-imagen"
+    if v in ("replicate", "flux"):
+        return "replicate"
     if v == "hybrid":
         return "hybrid"
     return "stock"
 
 
 class Config:
+    # Presets длительности для long-формата
+    LONG_FORMAT_PRESETS = {
+        "30 minutes": {"min_chapters": 10, "max_chapters": 14, "scenes_per_chapter": 8},
+        "1 hour": {"min_chapters": 18, "max_chapters": 24, "scenes_per_chapter": 10},
+    }
+
+    # Style Presets
+    STYLE_PRESETS = [
+        "default",
+        "viral_shorts",
+        "documentary_clean",
+        "cinematic_premium",
+        "mystery_dark",
+        "educational_explainer"
+    ]
+
+    # Voice Profiles
+    VOICE_PROFILES = [
+        "default",
+        "documentary_authoritative",
+        "soft_mystery",
+        "dramatic_epic",
+        "educational_clear",
+        "viral_fast"
+    ]
+
+    # Subtitle Styles
+    SUBTITLE_STYLES = [
+        "default",
+        "viral_big_caps",
+        "documentary_clean_lower",
+        "premium_minimal",
+        "education_readable",
+        "dramatic_highlighted"
+    ]
+
+    # Montage Patterns
+    MONTAGE_PATTERNS = [
+        "default",
+        "hook_fast",
+        "documentary_flow",
+        "tension_rise",
+        "epic_reveal",
+        "calm_reflection"
+    ]
+
+    # New flags from TZ
+    KEEP_INTERMEDIATES = os.getenv("KEEP_INTERMEDIATES", "false").lower() in ("true", "1", "yes")
+    MIN_VISUAL_SCORE = float(os.getenv("MIN_VISUAL_SCORE", "0.6"))
+
     ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
     ANTHROPIC_MAX_RETRIES = int(os.getenv("ANTHROPIC_MAX_RETRIES", "3"))
     ANTHROPIC_RETRY_BASE_DELAY_SEC = float(os.getenv("ANTHROPIC_RETRY_BASE_DELAY_SEC", "1.0"))

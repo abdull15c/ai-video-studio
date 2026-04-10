@@ -12,13 +12,14 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from config import Config
 from database import (
+    update_project_avatar,
     PIPELINE_STEPS,
     count_projects_stats,
     derive_project_ui_status,
@@ -30,6 +31,9 @@ from database import (
     insert_dashboard_project,
     list_projects_paginated,
     sum_llm_usage_estimated_usd_for_project,
+    update_scene_fields,
+    get_scene_by_id,
+    get_project_id_by_scene,
 )
 from dashboard.models import (
     ChapterDetail,
@@ -288,6 +292,16 @@ async def api_project_detail(project_id: int):
                     mood=sc.get("mood"),
                     camera=sc.get("camera"),
                     duration_sec=sc.get("duration_sec"),
+                    scene_goal=sc.get("scene_goal"),
+                    visual_role=sc.get("visual_role"),
+                    shot_type=sc.get("shot_type"),
+                    motion_type=sc.get("motion_type"),
+                    transition_in=sc.get("transition_in"),
+                    transition_out=sc.get("transition_out"),
+                    intensity=str(sc.get("intensity", "")),
+                    continuity_anchor=sc.get("continuity_anchor"),
+                    scene_status=sc.get("scene_status"),
+                    manual_override_json=sc.get("manual_override_json"),
                 )
                 for sc in ch.get("scenes", [])
             ],
@@ -352,10 +366,44 @@ async def api_project_thumbnail(project_id: int):
     return FileResponse(path, media_type="image/jpeg")
 
 
+@app.post("/api/projects/{project_id}/avatar")
+async def api_project_avatar_upload(project_id: int, file: UploadFile = File(...)):
+    """Загрузка файла аватара для конкретного проекта"""
+    row = get_project_row(project_id)
+    if not row:
+        raise HTTPException(404, "Проект не найден")
+        
+    ext = Path(file.filename).suffix.lower()
+    if ext not in [".png", ".jpg", ".jpeg", ".mp4"]:
+        raise HTTPException(400, "Поддерживаются только форматы PNG, JPG и MP4")
+        
+    is_video = ext == ".mp4"
+    avatar_type = "mp4" if is_video else "png"
+    target_name = f"avatar.{avatar_type}"
+    
+    project_dir = STORAGE / "projects" / str(project_id)
+    project_dir.mkdir(parents=True, exist_ok=True)
+    
+    target_path = project_dir / target_name
+    
+    # Удаляем старые аватары
+    old_png = project_dir / "avatar.png"
+    old_mp4 = project_dir / "avatar.mp4"
+    if old_png.exists(): old_png.unlink()
+    if old_mp4.exists(): old_mp4.unlink()
+    
+    with open(target_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+        
+    update_project_avatar(project_id, avatar_type)
+    
+    return {"ok": True, "message": "Аватар успешно загружен", "avatar_type": avatar_type}
+
+
 @app.post("/api/projects", response_model=NewProjectResponse)
 async def api_new_project(body: NewProjectRequest):
     topic = body.topic.strip()
-    pid = insert_dashboard_project(topic, body.format, body.voice)
+    pid = insert_dashboard_project(topic, body.format, body.voice, preset=body.preset)
     cmd = [sys.executable, str(REPO_ROOT / "main.py"), "--project-id", str(pid)]
     try:
         subprocess.Popen(
@@ -417,3 +465,159 @@ async def api_queue_reorder(body: QueueReorderRequest):
     new_lines = [topics[i] for i in body.order]
     _write_queue(new_lines)
     return {"ok": True}
+
+# -----------------
+# Scene Management (Human-in-the-loop)
+# -----------------
+
+@app.patch("/api/scenes/{scene_id}")
+async def api_update_scene(scene_id: int, updates: dict):
+    """Обновление полей сцены (narration, image_prompt и т.д.)"""
+    scene = get_scene_by_id(scene_id)
+    if not scene:
+        raise HTTPException(404, "Сцена не найдена")
+        
+    update_scene_fields(scene_id, updates)
+    return {"ok": True, "message": "Сцена обновлена"}
+
+@app.post("/api/scenes/{scene_id}/approve")
+async def api_approve_scene(scene_id: int):
+    scene = get_scene_by_id(scene_id)
+    if not scene:
+        raise HTTPException(404, "Сцена не найдена")
+    update_scene_fields(scene_id, {"scene_status": "approved"})
+    return {"ok": True, "message": "Сцена утверждена"}
+
+@app.post("/api/scenes/{scene_id}/reject")
+async def api_reject_scene(scene_id: int):
+    scene = get_scene_by_id(scene_id)
+    if not scene:
+        raise HTTPException(404, "Сцена не найдена")
+    update_scene_fields(scene_id, {"scene_status": "rejected"})
+    return {"ok": True, "message": "Сцена отклонена (нужна перегенерация)"}
+
+@app.post("/api/scenes/{scene_id}/regenerate-voice")
+async def api_regenerate_scene_voice(scene_id: int):
+    project_id = get_project_id_by_scene(scene_id)
+    if not project_id:
+        raise HTTPException(404, "Сцена или проект не найдены")
+        
+    cmd = [sys.executable, str(REPO_ROOT / "main.py"), "--project-id", str(project_id), "--regenerate-scene", str(scene_id)]
+    try:
+        subprocess.Popen(
+            cmd,
+            cwd=str(REPO_ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env=dict(os.environ, REGENERATE_TARGET="voice")
+        )
+    except OSError as e:
+        raise HTTPException(500, f"Не удалось запустить процесс: {e}") from e
+    
+    update_scene_fields(scene_id, {"scene_status": "retry_pending"})
+    return {"ok": True, "message": "Запущена перегенерация аудио для сцены"}
+
+@app.post("/api/scenes/{scene_id}/regenerate-visual")
+async def api_regenerate_scene_visual(scene_id: int):
+    project_id = get_project_id_by_scene(scene_id)
+    if not project_id:
+        raise HTTPException(404, "Сцена или проект не найдены")
+        
+    cmd = [sys.executable, str(REPO_ROOT / "main.py"), "--project-id", str(project_id), "--regenerate-scene", str(scene_id)]
+    try:
+        subprocess.Popen(
+            cmd,
+            cwd=str(REPO_ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env=dict(os.environ, REGENERATE_TARGET="visual")
+        )
+    except OSError as e:
+        raise HTTPException(500, f"Не удалось запустить процесс: {e}") from e
+        
+    update_scene_fields(scene_id, {"scene_status": "retry_pending"})
+    return {"ok": True, "message": "Запущена перегенерация визуала для сцены"}
+
+@app.get("/api/projects/{project_id}/quality-report")
+async def api_project_quality_report(project_id: int):
+    """Возвращает детальный отчет о качестве проекта (записывает в БД и отдает клиенту)."""
+    row = get_project_row(project_id)
+    if not row:
+        raise HTTPException(404, "Проект не найден")
+        
+    script_raw = get_project_script(project_id, require_scenes=False)
+    
+    total_score = 0
+    scored_scenes = 0
+    needs_review_count = 0
+    report_scenes = []
+    
+    from config import Config
+    
+    for ch in script_raw:
+        for sc in ch.get("scenes", []):
+            vs = sc.get("visual_score")
+            st = sc.get("scene_status", "pending")
+            reason = sc.get("review_reason", "")
+            
+            if vs is not None:
+                total_score += vs
+                scored_scenes += 1
+                
+            if st == "needs_review":
+                needs_review_count += 1
+                
+            warnings = []
+            if vs is not None and vs < Config.MIN_VISUAL_SCORE:
+                warnings.append("Низкий visual_score")
+            if sc.get("technical_score") is not None and sc.get("technical_score") < 0.8:
+                warnings.append("Низкое техническое качество видео (FPS или битрейт)")
+            if sc.get("semantic_match_score") is not None and sc.get("semantic_match_score") < 0.6:
+                warnings.append("Слабое соответствие кадра и текста")
+            if sc.get("continuity_score") is not None and sc.get("continuity_score") < 0.7:
+                warnings.append("Нарушен Continuity Anchor")
+                
+            report_scenes.append({
+                "scene_id": sc["id"],
+                "scene_number": sc["number"],
+                "visual_score": vs,
+                "semantic_match_score": sc.get("semantic_match_score"),
+                "continuity_score": sc.get("continuity_score"),
+                "status": st,
+                "review_reason": reason,
+                "warnings": warnings
+            })
+            
+    avg_score = (total_score / scored_scenes) if scored_scenes > 0 else None
+    
+    report_data = {
+        "project_id": project_id,
+        "overall_score": avg_score,
+        "weak_scene_count": needs_review_count,
+        "is_ready_for_render": needs_review_count == 0,
+        "scenes_report": report_scenes
+    }
+    
+    # Save final score and report to database
+    from database import get_connection
+    import json
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    if avg_score is not None:
+        cursor.execute("UPDATE projects SET final_quality_score = ?, quality_report_json = ? WHERE id = ?", 
+                       (avg_score, json.dumps(report_data, ensure_ascii=False), project_id))
+    
+    # Insert into project_quality_reports
+    cursor.execute("""
+        INSERT INTO project_quality_reports 
+        (project_id, overall_score, weak_scene_count, avg_visual_score, warnings_json) 
+        VALUES (?, ?, ?, ?, ?)
+    """, (project_id, avg_score, needs_review_count, avg_score, json.dumps([s for s in report_scenes if s["warnings"]], ensure_ascii=False)))
+    
+    conn.commit()
+    conn.close()
+        
+    return report_data

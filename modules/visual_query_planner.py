@@ -7,7 +7,7 @@ from .json_extract import clean_json_from_llm
 logger = logging.getLogger(__name__)
 
 
-def plan_visual_queries(narration, image_prompt, mood, camera, project_id=None):
+def plan_visual_queries(narration, image_prompt, mood, camera, project_id=None, scene_index=0):
     logger.info("ИИ-режиссёр: подбор визуальных запросов для стока")
 
     fallback_plan = {
@@ -23,8 +23,16 @@ def plan_visual_queries(narration, image_prompt, mood, camera, project_id=None):
 
     model = CLAUDE_MODEL_HAIKU if Config.LLM_PROVIDER == "anthropic" else None
 
-    prompt = f'''You are a Senior Visual Director for a documentary YouTube channel.
-    Your job is to translate the scene into SHORT English search queries for stock VIDEO sites (Pexels/Pixabay).
+    if not hasattr(plan_visual_queries, '_recent_queries'):
+        plan_visual_queries._recent_queries = []
+        
+    used_queries_text = ""
+    if scene_index > 0 and plan_visual_queries._recent_queries:
+        recent = plan_visual_queries._recent_queries[-5:]
+        used_queries_text = f"\n    ALREADY USED queries (DO NOT REPEAT): {', '.join(recent)}"
+
+    prompt = f'''You are a Senior Visual Director & Cinematographer for a TOP-10 YouTube documentary channel.
+    Your job is to translate the scene into SHORT, HIGH-QUALITY English search queries for premium stock video sites.
 
     Scene Data:
     Narration: "{narration}"
@@ -32,31 +40,31 @@ def plan_visual_queries(narration, image_prompt, mood, camera, project_id=None):
     Mood: {mood}
     Camera: {camera}
 
-    STOCK-FRIENDLY CONTENT (high chance of good dynamic footage):
-    Prefer themes that stock libraries actually have in quantity: people in motion, nature, water, fire, weather,
-    cities, traffic, animals, sports, hands doing generic actions, sky/clouds, forests, beaches, roads, timelapse-friendly motion.
-
-    AVOID queries that rarely return good VIDEO on stock sites:
-    Specific weapons, named historical artifacts, classified/secret documents, ultra-niche props,
-    exact rare objects ("Soviet rocket model X"), misspelled or overly specific combinations ("torn tent snow").
-
-    ACTION NOT STATIC OBJECT — every query must describe MOVEMENT or a dynamic situation, not a still prop.
-    This applies to both Pexels and Pixabay: motion-focused queries return better footage on both sites.
-    - NOT "old map" → USE "hands opening old book" or "camera panning over paper"
-    - NOT "mountain peak" → USE "clouds moving over mountain" or "aerial flying mountains"
-    - NOT "classified documents" → USE "person walking dark corridor" or "papers shuffling desk"
-    - NOT "torn tent" → USE "wind blowing fabric" or "camping storm trees"
-
+    CINEMATOGRAPHY RULES (CRITICAL):
+    1. Every query MUST include camera movement or subject motion. Use terms like: "pan", "zoom", "tilt", "tracking", "timelapse", "aerial", "slow motion", "walking", "running", "flying".
+    2. Prefer themes that stock libraries have in abundance in 4K: nature, water, fire, futuristic cities, neon streets, cinematic close-ups of hands, epic landscapes, abstract data flows, storms.
+    3. AVOID hyper-specific objects ("Soviet rocket model X"). Use visual metaphors instead (e.g., "rocket taking off fire").
+    
+    EXAMPLES OF GOOD QUERIES:
+    - "camera panning over old map"
+    - "aerial flying over mountains"
+    - "slow motion rain window"
+    - "timelapse city night traffic"
+    - "neon cyberpunk street walking"
+    
     RULES:
-    1. Maximum 2-4 words per query (English). No long phrases.
-    2. Each of primary + alts + fallbacks must imply visible motion or change in the frame.
-    3. If the scene is abstract, use a visual metaphor with motion (e.g. tension → "lightning storm clouds").
+    1. Maximum 3-5 words per query (English).
+    2. ALTS are used for JUMP-CUTS! They must be visually distinct from the primary query but fit the same scene (e.g., Primary: "aerial mountains", Alt 1: "close up hiking boots", Alt 2: "timelapse clouds peak").
+
+    {used_queries_text}
+    IMPORTANT: Make this query VISUALLY DISTINCT from previous scenes. Use different camera angles,
+    different subjects, different lighting. Think like a film editor — variety keeps viewers watching.
 
     Return ONLY a JSON object:
     {{
-        "primary_query": "best short query with implied motion",
-        "alt_queries": ["alt 1", "alt 2", "alt 3", "alt 4"],
-        "fallback_queries": ["generic motion 1", "generic motion 2"],
+        "primary_query": "cinematic query with motion",
+        "alt_queries": ["distinct cinematic alt 1", "distinct cinematic alt 2", "distinct cinematic alt 3"],
+        "fallback_queries": ["safe generic motion 1", "safe generic motion 2"],
         "visual_mode": "literal or metaphor or atmospheric",
         "stock_confidence": "high or medium or low"
     }}'''
@@ -73,6 +81,12 @@ def plan_visual_queries(narration, image_prompt, mood, camera, project_id=None):
         plan = json.loads(clean_json_from_llm(raw))
         if "primary_query" not in plan:
             raise ValueError("Invalid JSON structure")
+            
+        plan_visual_queries._recent_queries.append(plan["primary_query"])
+        # Keep only the last 20 queries to prevent memory leak
+        if len(plan_visual_queries._recent_queries) > 20:
+            plan_visual_queries._recent_queries.pop(0)
+            
         return plan
     except Exception as e:
         logger.warning("ИИ-режиссёр: %s — fallback-план", e)

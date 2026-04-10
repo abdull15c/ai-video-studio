@@ -407,6 +407,60 @@ def _sort_candidates(
     )
 
 
+def get_smart_stock_multiple(
+    visual_plan,
+    is_vertical,
+    target_path_base,
+    count=2,
+    min_duration_sec: Optional[float] = None,
+    used_urls: Optional[Set[str]] = None,
+) -> Tuple[bool, List[str]]:
+    """Скачивает до `count` видео для одной длинной сцены (Jump-cuts). Возвращает список сохраненных путей."""
+    if used_urls is None:
+        used_urls = set()
+
+    queries_to_try = (
+        [visual_plan["primary_query"]]
+        + list(visual_plan.get("alt_queries") or [])
+        + list(visual_plan.get("fallback_queries") or [])
+    )
+
+    required_sec = float(min_duration_sec) / count if min_duration_sec else 3.0
+    required_sec = max(2.5, required_sec)
+    api_thresholds = [required_sec, max(required_sec * 0.8, 2.5)]
+
+    downloaded_paths = []
+    downloaded_count = 0
+
+    for min_api in api_thresholds:
+        for q in queries_to_try:
+            if not q or len(str(q).strip()) < 2:
+                continue
+            for strict in (True, False):
+                pool = _merged_candidates_for_query(
+                    str(q).strip(), is_vertical, min_api, used_urls, strict
+                )
+                ranked = _sort_candidates(pool, required_sec, is_vertical)
+                
+                for c in ranked:
+                    if downloaded_count >= count:
+                        return True, downloaded_paths
+                    if c.url in used_urls:
+                        continue
+                    
+                    part_path = f"{target_path_base}_part{downloaded_count+1}.mp4"
+                    if download_video(c.url, part_path, min_duration_required=required_sec):
+                        used_urls.add(c.url)
+                        downloaded_paths.append(part_path)
+                        downloaded_count += 1
+                        
+    # Если не нашли достаточно кусков, но хотя бы один нашли — отдаем успех
+    if downloaded_count > 0:
+        return True, downloaded_paths
+        
+    return False, []
+
+
 def get_smart_stock(
     visual_plan,
     is_vertical,

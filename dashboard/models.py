@@ -49,6 +49,27 @@ class SceneDetail(BaseModel):
     mood: Optional[str] = None
     camera: Optional[str] = None
     duration_sec: Optional[float] = None
+    scene_goal: Optional[str] = None
+    visual_role: Optional[str] = None
+    shot_type: Optional[str] = None
+    motion_type: Optional[str] = None
+    transition_in: Optional[str] = None
+    transition_out: Optional[str] = None
+    intensity: Optional[str] = None
+    continuity_anchor: Optional[str] = None
+    scene_role: Optional[str] = None
+    energy_curve: Optional[str] = None
+    edit_density: Optional[str] = None
+    semantic_match_score: Optional[float] = None
+    motion_score: Optional[float] = None
+    technical_score: Optional[float] = None
+    continuity_score: Optional[float] = None
+    review_reason: Optional[str] = None
+    visual_score: Optional[float] = None
+    audio_score: Optional[float] = None
+    subtitle_score: Optional[float] = None
+    scene_status: Optional[str] = None
+    manual_override_json: Optional[str] = None
 
 
 class ChapterDetail(BaseModel):
@@ -76,6 +97,17 @@ class ProjectDetailResponse(BaseModel):
     llm_usage_estimated_usd: Optional[float] = None
     download_url: str
     thumbnail_url: Optional[str] = None
+    avatar_type: Optional[str] = "none"
+    style_preset: Optional[str] = None
+    subtitle_style: Optional[str] = None
+    voice_profile: Optional[str] = None
+    quality_mode: Optional[str] = None
+    manual_review_required: Optional[bool] = False
+    keep_intermediates: Optional[bool] = False
+    final_quality_score: Optional[float] = None
+    quality_report_json: Optional[str] = None
+    review_notes: Optional[str] = None
+    audio_mastering_preset: Optional[str] = None
 
 
 class ProjectLogsResponse(BaseModel):
@@ -86,6 +118,7 @@ class NewProjectRequest(BaseModel):
     topic: str = Field(..., min_length=1, max_length=500)
     format: Literal["short", "main", "long"] = "short"
     voice: Optional[str] = None
+    preset: Optional[str] = "1 hour"  # "30 minutes" | "1 hour"
 
     @field_validator("voice")
     @classmethod
